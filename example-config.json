@@ -1,0 +1,13 @@
+{
+  "repo_roots": [
+    "~/projects/backend",
+    "~/projects/frontend",
+    "~/projects/libraries"
+  ],
+  "max_output": 20000,
+  "cache_ttl_seconds": 300,
+  "auth_token": "",
+  "transport": "stdio",
+  "host": "127.0.0.1",
+  "port": 7200
+}
