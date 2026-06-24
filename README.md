@@ -19,8 +19,44 @@ cp example-config.json ~/.repobridge.json
 
 # 3. Add to your AI tool (see "Connecting Your AI Agent" below)
 
-# 4. Done — your AI agent can now search your repos
+# 4. Done - your AI agent can now search your repos
 ```
+
+### One-line install for Claude Code (recommended)
+
+Instead of the manual steps above, run:
+
+```bash
+./install.sh
+```
+
+This single script:
+- Creates the Python venv and installs repobridge
+- Prompts for your repo root directories and writes `~/.repobridge.json`
+  (if you skip, a hook will prompt Claude to configure it automatically on first use)
+- Registers the MCP server at **user scope** so it works in every project
+- Installs two PreToolUse hooks into `~/.claude/settings.json`:
+
+| Hook | Trigger | Action |
+|---|---|---|
+| `repobridge-nudge` | Any `grep`/`find`/`cat`/`ls`/`git -C` aimed at *another* repo | Asks Claude to use `mcp__repobridge__*` tools instead |
+| `repobridge-ensure-roots` | Any `mcp__repobridge__*` tool call | If no roots configured, asks Claude to collect and write them |
+
+**The nudge hook uses `permissionDecision: "ask"`** - it surfaces a prompt,
+never hard-blocks. False positives cost one click; write commands and the current
+project directory are never intercepted.
+
+**Restart Claude Code** after running `./install.sh` to load the hook and MCP server.
+
+#### Uninstall
+
+```bash
+./uninstall.sh
+```
+
+Removes the two hook entries from `~/.claude/settings.json`, unregisters the MCP
+server, and (with confirmation) optionally deletes `~/.repobridge.json` and `.venv`.
+A backup of `settings.json` is created at `settings.json.bak` before any changes.
 
 ## Requirements
 
