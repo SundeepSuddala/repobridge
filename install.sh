@@ -71,7 +71,7 @@ else
     echo "    ~/Documents/GitHub/Backend  (which contains user-service/, order-service/, ...)"
     echo ""
     if _tty; then
-        printf "  Enter repo root dirs (space-separated), or press Enter to skip:\n  > "
+        printf "  Enter repo root dirs (colon-separated, e.g. ~/GitHub/Backend:~/GitHub/Own), or press Enter to skip:\n  > "
         read -r ROOT_INPUT || ROOT_INPUT=""
     else
         ROOT_INPUT=""
@@ -83,7 +83,7 @@ else
         "$PYTHON" - "$REPOBRIDGE_CFG" "$ROOT_INPUT" <<'PYEOF'
 import json, os, sys
 cfg_path = sys.argv[1]
-raw_roots = sys.argv[2].split()
+raw_roots = [r.strip() for r in sys.argv[2].split(":") if r.strip()]
 expanded = [os.path.expanduser(r) for r in raw_roots]
 
 try:
