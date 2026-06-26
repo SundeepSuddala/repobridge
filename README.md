@@ -539,17 +539,22 @@ find_repos_with(pattern="react-router", file_glob="package.json")
 ## Architecture
 
 ```
-server.py (single file)
-├── CLI & Transport     — stdio, SSE, or streamable-http (configurable)
-├── Logging             — structured logging via Python logging module
-├── Configuration       — CLI args > env vars > config file > defaults
-├── Input validation    — path traversal, command injection, branch names
-├── Search backend      — ripgrep (preferred) or grep (fallback)
-├── Caching             — thread-safe TTL cache for repo discovery
-├── Auth                — optional timing-safe token validation
-├── Helpers             — _all_repos(), _resolve_repo(), _run(), _truncate()
-├── 10 MCP Tools        — @mcp.tool() decorated functions
-└── Entry point         — main() with argparse → mcp.run(transport=...)
+repobridge_config.py    — shared: load_roots(), has_roots(), discover_repos()
+server.py
+├── CLI & Transport     - stdio, SSE, or streamable-http (configurable)
+├── Logging             - structured logging via Python logging module
+├── Configuration       - CLI args > env vars > config file > defaults
+├── ToolContext         - injectable bundle: max_output, auth_token, backend
+├── SearchBackend       - Protocol + RipgrepBackend / GrepBackend implementations
+├── TTLCache            - generic thread-safe TTL cache (repo discovery, IDE detection)
+├── Input validation    - path traversal, command injection, branch names
+├── Auth                - @_require_auth decorator, timing-safe hmac.compare_digest
+├── Helpers             - _all_repos(), _resolve_repo(), _run(), _truncate()
+├── 10 MCP Tools        - @mcp.tool() + @_require_auth decorated functions
+└── Entry point         - main() with argparse → mcp.run(transport=...)
+hooks/
+├── repobridge-nudge.py         - PreToolUse: redirect cross-repo bash to MCP tools
+└── repobridge-ensure-roots.py  - PreToolUse: prompt for config if no roots set
 ```
 
 ## Troubleshooting
