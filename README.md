@@ -526,6 +526,18 @@ find_repos_with(pattern="react-router", file_glob="package.json")
 
 ---
 
+### `get_ide_status`
+
+Detect which IDEs are running and which semantic MCP tools they expose. Call this before `search_code` when looking up symbols - IDE tools give semantic results (handles generics, overloads, cross-module resolution) while `search_code` gives text matches.
+
+```
+get_ide_status()
+```
+
+No parameters. Returns a list of running IDEs, their available MCP tools, and guidance on when to prefer IDE tools over `search_code`.
+
+---
+
 ## Security
 
 - **Path traversal prevention**: `read_file` and `list_files` validate that resolved paths stay within repo boundaries using `Path.is_relative_to()`.
@@ -550,7 +562,7 @@ server.py
 ├── Input validation    - path traversal, command injection, branch names
 ├── Auth                - @_require_auth decorator, timing-safe hmac.compare_digest
 ├── Helpers             - _all_repos(), _resolve_repo(), _run(), _truncate()
-├── 10 MCP Tools        - @mcp.tool() + @_require_auth decorated functions
+├── 11 MCP Tools        - @mcp.tool() + @_require_auth decorated functions
 └── Entry point         - main() with argparse → mcp.run(transport=...)
 hooks/
 ├── repobridge-nudge.py         - PreToolUse: redirect cross-repo bash to MCP tools

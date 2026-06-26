@@ -14,6 +14,7 @@ Exit 0 always - a bug here must never block MCP tool calls.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 
