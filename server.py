@@ -31,18 +31,25 @@ Tools exposed:
 from __future__ import annotations
 
 import argparse
+import functools
 import hmac
 import logging
 import os
 import json
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Generic, Protocol, TypeVar
 
 from mcp.server.fastmcp import FastMCP
+from repobridge_config import load_roots, discover_repos
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -71,6 +78,36 @@ _BLOCKED_ARG_PREFIXES = frozenset({
     "--build-file", "-b",
 })
 
+# ── TTL Cache ─────────────────────────────────────────────────────────────────
+
+_V = TypeVar("_V")
+
+
+class TTLCache(Generic[_V]):
+    """Thread-safe single-value cache with time-to-live expiry."""
+
+    def __init__(self, ttl_seconds: float) -> None:
+        self._ttl = ttl_seconds
+        self._value: _V | None = None
+        self._ts: float = 0.0
+        self._lock = threading.Lock()
+
+    def get(self, compute: Callable[[], _V]) -> _V:
+        """Return cached value if fresh, otherwise call compute() and cache result."""
+        now = time.monotonic()
+        with self._lock:
+            if self._value is not None and (now - self._ts) < self._ttl:
+                return self._value
+            self._value = compute()
+            self._ts = now
+            return self._value
+
+    def invalidate(self) -> None:
+        """Evict the cached value."""
+        with self._lock:
+            self._value = None
+            self._ts = 0.0
+
 
 def _load_config() -> dict:
     """Load configuration from ~/.repobridge.json if it exists."""
@@ -90,22 +127,13 @@ _config = _load_config()
 
 
 def _get_repo_roots() -> list[str]:
-    """Resolve REPO_ROOTS from env var > config file > defaults."""
-    env_roots = os.environ.get("REPOBRIDGE_ROOTS")
-    if env_roots:
-        roots = [os.path.expanduser(r.strip()) for r in env_roots.split(":") if r.strip()]
-        logger.info("Using repo roots from REPOBRIDGE_ROOTS env var: %d directories", len(roots))
-        return roots
-
-    config_roots = _config.get("repo_roots")
-    if config_roots and isinstance(config_roots, list):
-        roots = [os.path.expanduser(r) for r in config_roots]
-        logger.info("Using repo roots from config file: %d directories", len(roots))
-        return roots
-
+    """Resolve REPO_ROOTS via shared config module (env var > config file > defaults)."""
+    roots = load_roots()
+    if roots:
+        logger.info("Using repo roots: %d directories", len(roots))
+        return [str(r) for r in roots]
     if _DEFAULT_REPO_ROOTS:
         return _DEFAULT_REPO_ROOTS
-
     logger.warning(
         "No repo roots configured. Set REPOBRIDGE_ROOTS env var or create ~/.repobridge.json. "
         "See README.md for details."
@@ -155,18 +183,195 @@ if _HAS_RIPGREP:
 else:
     logger.info("ripgrep not found, falling back to grep")
 
+# ── Search backends ───────────────────────────────────────────────────────────
+
+
+class SearchBackend(Protocol):
+    def search(
+        self,
+        pattern: str,
+        repos: dict[str, Path],
+        file_glob: str,
+        case_sensitive: bool,
+        context_lines: int,
+    ) -> tuple[dict[str, str], bool]:
+        """Search for pattern across repos. Returns ({repo: output}, timed_out)."""
+        ...
+
+    def find_files(
+        self,
+        pattern: str,
+        repos: dict[str, Path],
+        file_glob: str,
+        case_sensitive: bool,
+    ) -> tuple[dict[str, int], bool]:
+        """Find repos containing pattern. Returns ({repo: file_count}, timed_out)."""
+        ...
+
+
+class RipgrepBackend:
+    """Search backend using a single rg pass across all repo roots."""
+
+    def search(
+        self,
+        pattern: str,
+        repos: dict[str, Path],
+        file_glob: str,
+        case_sensitive: bool,
+        context_lines: int,
+    ) -> tuple[dict[str, str], bool]:
+        resolved = {name: str(path.resolve()) for name, path in repos.items()}
+        sorted_repos = sorted(resolved.items(), key=lambda x: len(x[1]), reverse=True)
+        all_paths = [rpath for _, rpath in sorted_repos]
+
+        cmd = ["rg", "-n", f"-C{context_lines}", "-g", file_glob]
+        if not case_sensitive:
+            cmd.append("-i")
+        cmd.append(pattern)
+        cmd.extend(all_paths)
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=60,
+            )
+            raw = result.stdout
+        except (subprocess.TimeoutExpired, OSError):
+            return {}, True
+
+        if not raw.strip():
+            return {}, False
+
+        buckets: dict[str, list[str]] = {name: [] for name in repos}
+        current_repo: str | None = None
+
+        for line in raw.splitlines():
+            if line == "--":
+                if current_repo:
+                    buckets[current_repo].append("--")
+                continue
+            matched = False
+            for name, rpath in sorted_repos:
+                prefix = rpath + "/"
+                if line.startswith(prefix):
+                    current_repo = name
+                    line = "./" + line[len(prefix):]
+                    matched = True
+                    break
+            if not matched and line.startswith("/"):
+                current_repo = None
+            if current_repo:
+                buckets[current_repo].append(line)
+
+        hits = {
+            name: "\n".join(lines).strip("--\n").strip()
+            for name, lines in buckets.items()
+            if any(ln != "--" for ln in lines)
+        }
+        return hits, False
+
+    def find_files(
+        self,
+        pattern: str,
+        repos: dict[str, Path],
+        file_glob: str,
+        case_sensitive: bool,
+    ) -> tuple[dict[str, int], bool]:
+        resolved = {name: str(path.resolve()) for name, path in repos.items()}
+        sorted_repos = sorted(resolved.items(), key=lambda x: len(x[1]), reverse=True)
+        cmd = ["rg", "-l", "-g", file_glob]
+        if not case_sensitive:
+            cmd.append("-i")
+        cmd.append(pattern)
+        cmd.extend(rpath for _, rpath in sorted_repos)
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=60,
+            )
+            counts: dict[str, int] = {}
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                for name, rpath in sorted_repos:
+                    if line.startswith(rpath + "/"):
+                        counts[name] = counts.get(name, 0) + 1
+                        break
+            return counts, False
+        except (subprocess.TimeoutExpired, OSError):
+            return {}, True
+
+
+class GrepBackend:
+    """Search backend using parallel grep subprocesses - one per repo."""
+
+    def search(
+        self,
+        pattern: str,
+        repos: dict[str, Path],
+        file_glob: str,
+        case_sensitive: bool,
+        context_lines: int,
+    ) -> tuple[dict[str, str], bool]:
+        cmd = _build_search_cmd(pattern, file_glob, case_sensitive, context_lines)
+        results = _search_repos_parallel(repos, cmd)
+        timed_out = any("[TIMEOUT" in out for out in results.values())
+        return results, timed_out
+
+    def find_files(
+        self,
+        pattern: str,
+        repos: dict[str, Path],
+        file_glob: str,
+        case_sensitive: bool,
+    ) -> tuple[dict[str, int], bool]:
+        cmd = _build_search_cmd(pattern, file_glob, case_sensitive, context_lines=0, files_only=True)
+        results = _search_repos_parallel(repos, cmd)
+        timed_out = any("[TIMEOUT" in out for out in results.values())
+        counts: dict[str, int] = {}
+        for name, out in results.items():
+            if "[TIMEOUT" not in out and not out.startswith("[ERROR"):
+                files = [ln for ln in out.strip().splitlines() if ln and not ln.startswith("[")]
+                if files:
+                    counts[name] = len(files)
+        return counts, timed_out
+
+
+# ── Tool context ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class ToolContext:
+    """Injectable bundle of runtime dependencies used by all MCP tools."""
+    max_output: int
+    auth_token: str
+    backend: SearchBackend
+
+
 # ── Caching ──────────────────────────────────────────────────────────────────
 
-_repo_cache: dict[str, Path] | None = None
-_repo_cache_time: float = 0.0
-_repo_cache_lock = threading.Lock()
+_IDE_CACHE_TTL = 30.0
+
+_repo_cache: TTLCache[dict[str, Path]] = TTLCache(CACHE_TTL)
+_ide_cache: TTLCache[list[tuple[str, str]]] = TTLCache(_IDE_CACHE_TTL)
 
 
 def _invalidate_cache() -> None:
-    global _repo_cache, _repo_cache_time
-    with _repo_cache_lock:
-        _repo_cache = None
-        _repo_cache_time = 0.0
+    _repo_cache.invalidate()
+
+
+def _detect_ides_cached() -> list[tuple[str, str]]:
+    return _ide_cache.get(_detect_ides)
+
+
+_DEFAULT_BACKEND: SearchBackend = RipgrepBackend() if _HAS_RIPGREP else GrepBackend()
+
+_ctx = ToolContext(
+    max_output=MAX_OUTPUT,
+    auth_token=AUTH_TOKEN,
+    backend=_DEFAULT_BACKEND,
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -176,27 +381,12 @@ def _all_repos() -> dict[str, Path]:
 
     Results are cached for CACHE_TTL seconds.
     """
-    global _repo_cache, _repo_cache_time
-
-    now = time.monotonic()
-    with _repo_cache_lock:
-        if _repo_cache is not None and (now - _repo_cache_time) < CACHE_TTL:
-            return _repo_cache
-
-        repos: dict[str, Path] = {}
-        for root in REPO_ROOTS:
-            root_path = Path(root)
-            if not root_path.exists():
-                logger.debug("Repo root does not exist, skipping: %s", root)
-                continue
-            for entry in sorted(root_path.iterdir()):
-                if entry.is_dir() and (entry / ".git").exists():
-                    repos[entry.name] = entry
-
+    def _discover() -> dict[str, Path]:
+        repos = discover_repos([Path(r) for r in REPO_ROOTS])
         logger.debug("Discovered %d repositories", len(repos))
-        _repo_cache = repos
-        _repo_cache_time = now
         return repos
+
+    return _repo_cache.get(_discover)
 
 
 def _resolve_repo(repo_name: str) -> Path:
@@ -230,11 +420,112 @@ def _validate_file_path(repo: Path, file_path: str) -> Path:
 
 def _check_auth(token: str) -> str | None:
     """Validate auth token if MCP_AUTH_TOKEN is configured. Returns error string or None."""
-    if not AUTH_TOKEN:
+    if not _ctx.auth_token:
         return None
-    if not hmac.compare_digest(token, AUTH_TOKEN):
+    if not hmac.compare_digest(token, _ctx.auth_token):
         return "[AUTH ERROR] Invalid or missing auth token."
     return None
+
+
+def _require_auth(f):
+    """Decorator: check auth before calling the tool. Safe with FastMCP (follows __wrapped__)."""
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        auth_err = _check_auth(kwargs.get("auth", ""))
+        if auth_err:
+            return auth_err
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# ── IDE detection ─────────────────────────────────────────────────────────────
+
+_IDE_PORTS = {
+    "IntelliJ IDEA": [63342, 63343, 63344],
+    "VS Code":       [3000, 6010, 6011],
+    "Cursor":        [3000, 6010],
+    "Windsurf":      [3000, 6010],
+}
+
+_IDE_PROCESSES = {
+    "IntelliJ IDEA": ["idea", "IntelliJ IDEA"],
+    "VS Code":       ["code", "Code"],
+    "Cursor":        ["cursor", "Cursor"],
+    "Windsurf":      ["windsurf", "Windsurf"],
+}
+
+_IDE_MCP_TOOLS = {
+    "IntelliJ IDEA": "ide_find_references, ide_find_definition, ide_find_implementations, ide_search_text, ide_call_hierarchy",
+    "VS Code":       "ide_find_references, ide_find_definition (if MCP extension installed)",
+    "Cursor":        "built-in symbol search via @ context",
+    "Windsurf":      "built-in symbol search via Cascade",
+}
+
+
+def _running_processes() -> list[str]:
+    """Return list of running process names (cached per call)."""
+    try:
+        out = subprocess.run(
+            ["ps", "-axco", "comm"],
+            capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=5,
+        ).stdout
+        return out.splitlines()
+    except Exception:
+        return []
+
+
+def _port_open(port: int) -> bool:
+    """Check if a local TCP port is listening."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _detect_ides() -> list[tuple[str, str]]:
+    """
+    Detect running IDEs by process name and port.
+    Returns list of (ide_name, detection_method) tuples.
+    """
+    procs = set(_running_processes())
+    found = []
+    for ide, names in _IDE_PROCESSES.items():
+        # process match
+        if any(n in procs for n in names):
+            found.append((ide, "process"))
+            continue
+        # port match
+        ports = _IDE_PORTS.get(ide, [])
+        if any(_port_open(p) for p in ports):
+            found.append((ide, "port"))
+    return found
+
+
+
+def _search_repos_parallel(
+    repos: dict[str, Path],
+    cmd: list[str],
+    files_only: bool = False,
+) -> dict[str, str]:
+    """Run cmd in each repo concurrently. Returns {repo_name: output}."""
+    results: dict[str, str] = {}
+
+    def _search_one(name: str, path: Path) -> tuple[str, str]:
+        return name, _run(cmd, path)
+
+    max_workers = min(len(repos), (os.cpu_count() or 4) * 2)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_search_one, name, path): name for name, path in repos.items()}
+        for future in as_completed(futures):
+            repo_name = futures[future]
+            try:
+                name, out = future.result()
+                results[name] = out
+            except Exception:
+                results[repo_name] = "[ERROR] search failed"
+
+    return results
 
 
 def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> str:
@@ -244,11 +535,12 @@ def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> str:
             cmd,
             cwd=cwd,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             timeout=timeout,
         )
         output = result.stdout + result.stderr
-        return output[:MAX_OUTPUT] if len(output) > MAX_OUTPUT else output
+        return output[:_ctx.max_output] if len(output) > _ctx.max_output else output
     except subprocess.TimeoutExpired:
         logger.warning("Command timed out after %ds: %s", timeout, " ".join(cmd))
         return f"[TIMEOUT after {timeout}s]"
@@ -260,10 +552,16 @@ def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> str:
         return f"[ERROR] {e}"
 
 
+_GRAPHIFY_HINT = (
+    "\n[TIP] Search timed out. If graphify is installed, run /graphify on this "
+    "repo for a pre-indexed knowledge graph you can query without live grep."
+)
+
+
 def _truncate(text: str, label: str = "") -> str:
-    """Truncate text to MAX_OUTPUT characters with an indicator."""
-    if len(text) > MAX_OUTPUT:
-        return text[:MAX_OUTPUT] + f"\n\n... [{label}truncated at {MAX_OUTPUT} chars]"
+    """Truncate text to _ctx.max_output characters with an indicator."""
+    if len(text) > _ctx.max_output:
+        return text[:_ctx.max_output] + f"\n\n... [{label}truncated at {_ctx.max_output} chars]"
     return text
 
 
@@ -303,6 +601,7 @@ def _build_search_cmd(
         if not case_sensitive:
             cmd.append("-i")
         cmd.append(pattern)
+        cmd.append(".")  # explicit path - prevents rg from reading stdin when not a tty
     else:
         cmd = ["grep", "-rn" if not files_only else "-rl", f"--include={file_glob}"]
         if not files_only:
@@ -310,6 +609,7 @@ def _build_search_cmd(
         if not case_sensitive:
             cmd.append("-i")
         cmd.append(pattern)
+        cmd.append(".")  # explicit path - prevents grep stdin blocking on macOS BSD grep
     return cmd
 
 
@@ -319,6 +619,43 @@ mcp = FastMCP("repobridge")
 
 
 @mcp.tool()
+@_require_auth
+def get_ide_status(auth: str = "") -> str:
+    """
+    Detect which IDEs are currently running and which MCP tools they provide.
+
+    Use this before search_code when doing symbol lookups (class names, method
+    references, interface implementations). IDE tools give semantic results;
+    search_code gives text matches.
+
+    Returns: running IDEs, the MCP tools they expose, and when to prefer them
+    over search_code.
+    """
+    ides = _detect_ides_cached()
+    if not ides:
+        return (
+            "No IDE detected. Using text search (ripgrep/grep) via search_code.\n"
+            "Open IntelliJ IDEA, VS Code, Cursor, or Windsurf for semantic symbol search."
+        )
+
+    lines = ["IDE(s) detected - prefer IDE MCP tools over search_code for symbol lookups:\n"]
+    for ide, method in ides:
+        tools = _IDE_MCP_TOOLS.get(ide, "check IDE MCP plugin docs")
+        lines.append(f"  {ide} (detected via {method})")
+        lines.append(f"    Tools: {tools}")
+        lines.append("")
+
+    lines.append("When to use IDE tools vs search_code:")
+    lines.append("  ide_find_references     - all callers of a method/class (semantic, handles generics)")
+    lines.append("  ide_find_definition     - go to declaration")
+    lines.append("  ide_find_implementations - all classes implementing an interface")
+    lines.append("  ide_search_text         - text search scoped to open project")
+    lines.append("  search_code             - cross-repo text/regex when IDE is not open or pattern is not a symbol")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@_require_auth
 def list_repos(filter: str = "", auth: str = "") -> str:
     """
     List all available repositories with their current branch and dirty status.
@@ -327,10 +664,6 @@ def list_repos(filter: str = "", auth: str = "") -> str:
         filter: Optional substring to filter repo names (e.g. 'pricing', 'service')
         auth:   Auth token (required only if MCP_AUTH_TOKEN is set)
     """
-    auth_err = _check_auth(auth)
-    if auth_err:
-        return auth_err
-
     repos = _all_repos()
     if not repos:
         return (
@@ -351,6 +684,7 @@ def list_repos(filter: str = "", auth: str = "") -> str:
 
 
 @mcp.tool()
+@_require_auth
 def search_code(
     pattern: str,
     repo_name: str = "",
@@ -371,30 +705,48 @@ def search_code(
         context_lines:  Lines of context around each match
         auth:           Auth token (required only if MCP_AUTH_TOKEN is set)
     """
-    auth_err = _check_auth(auth)
-    if auth_err:
-        return auth_err
-
     if not pattern or not pattern.strip():
         return "[ERROR] pattern is required"
 
+    # Check for running IDEs - semantic tools beat text search for symbol lookups
+    ide_hint = ""
+    ides = _detect_ides_cached()
+    if ides:
+        ide_names = ", ".join(ide for ide, _ in ides)
+        ide_hint = (
+            f"[IDE DETECTED: {ide_names}] "
+            "For symbol/class/method lookups prefer ide_find_references or ide_find_definition "
+            "over this text search - they use the compiler index and handle generics/inheritance. "
+            "Text search results follow:\n\n"
+        )
+
     repos = {repo_name: _resolve_repo(repo_name)} if repo_name else _all_repos()
-    cmd = _build_search_cmd(pattern, file_glob, case_sensitive, context_lines)
+    hits, timed_out = _ctx.backend.search(
+        pattern, repos, file_glob, case_sensitive, context_lines
+    )
 
     results = []
-    for name, path in repos.items():
-        out = _run(cmd, path)
-        if out.strip():
+    for name, out in sorted(hits.items()):
+        if "[TIMEOUT" in out:
+            results.append(f"=== {name} ===\n{out.strip()}")
+        elif out.strip():
             results.append(f"=== {name} ===\n{out.strip()}")
 
     if not results:
-        return f"No matches for '{pattern}' in {'all repos' if not repo_name else repo_name}."
+        return (
+            ide_hint
+            + f"No matches for '{pattern}' in {'all repos' if not repo_name else repo_name}."
+        )
 
     combined = "\n\n".join(results)
-    return _truncate(combined, "search results ")
+    result = _truncate(combined, "search results ")
+    if timed_out:
+        result += _GRAPHIFY_HINT
+    return ide_hint + result
 
 
 @mcp.tool()
+@_require_auth
 def read_file(
     repo_name: str,
     file_path: str,
@@ -412,10 +764,6 @@ def read_file(
         limit:      Max lines to return (0 = entire file)
         auth:       Auth token (required only if MCP_AUTH_TOKEN is set)
     """
-    auth_err = _check_auth(auth)
-    if auth_err:
-        return auth_err
-
     repo = _resolve_repo(repo_name)
     full_path = _validate_file_path(repo, file_path)
 
@@ -425,7 +773,7 @@ def read_file(
         return f"Not a file: {file_path}"
 
     try:
-        max_read_bytes = MAX_OUTPUT * 4
+        max_read_bytes = _ctx.max_output * 4
         file_size = full_path.stat().st_size
         if file_size > max_read_bytes:
             with full_path.open("rb") as fh:
@@ -451,6 +799,7 @@ def read_file(
 
 
 @mcp.tool()
+@_require_auth
 def list_files(repo_name: str, pattern: str = "**/*.java", max_results: int = 100, auth: str = "") -> str:
     """
     List files matching a glob pattern in a repository.
@@ -461,10 +810,6 @@ def list_files(repo_name: str, pattern: str = "**/*.java", max_results: int = 10
         max_results: Cap on number of results
         auth:        Auth token (required only if MCP_AUTH_TOKEN is set)
     """
-    auth_err = _check_auth(auth)
-    if auth_err:
-        return auth_err
-
     repo = _resolve_repo(repo_name)
     matches = sorted(repo.glob(pattern))[:max_results]
 
@@ -483,6 +828,7 @@ def list_files(repo_name: str, pattern: str = "**/*.java", max_results: int = 10
 
 
 @mcp.tool()
+@_require_auth
 def git_status(repo_name: str, auth: str = "") -> str:
     """
     Show git status for a repository.
@@ -491,10 +837,6 @@ def git_status(repo_name: str, auth: str = "") -> str:
         repo_name: Repository name
         auth:      Auth token (required only if MCP_AUTH_TOKEN is set)
     """
-    auth_err = _check_auth(auth)
-    if auth_err:
-        return auth_err
-
     repo = _resolve_repo(repo_name)
     branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo).strip()
     status = _run(["git", "status", "--short"], repo)
@@ -504,6 +846,7 @@ def git_status(repo_name: str, auth: str = "") -> str:
 
 
 @mcp.tool()
+@_require_auth
 def git_diff(repo_name: str, target: str = "", auth: str = "") -> str:
     """
     Show git diff for a repository.
@@ -514,10 +857,6 @@ def git_diff(repo_name: str, target: str = "", auth: str = "") -> str:
                    branch name = diff vs that branch (e.g. 'main', 'develop')
         auth:      Auth token (required only if MCP_AUTH_TOKEN is set)
     """
-    auth_err = _check_auth(auth)
-    if auth_err:
-        return auth_err
-
     repo = _resolve_repo(repo_name)
 
     if target == "staged":
@@ -534,6 +873,7 @@ def git_diff(repo_name: str, target: str = "", auth: str = "") -> str:
 
 
 @mcp.tool()
+@_require_auth
 def git_log(repo_name: str, count: int = 10, branch: str = "", auth: str = "") -> str:
     """
     Show recent git commits for a repository.
@@ -544,10 +884,6 @@ def git_log(repo_name: str, count: int = 10, branch: str = "", auth: str = "") -
         branch:    Specific branch (defaults to current branch)
         auth:      Auth token (required only if MCP_AUTH_TOKEN is set)
     """
-    auth_err = _check_auth(auth)
-    if auth_err:
-        return auth_err
-
     repo = _resolve_repo(repo_name)
     count = min(max(count, 1), 100)
     cmd = ["git", "log", "--oneline", f"-{count}"]
@@ -559,6 +895,7 @@ def git_log(repo_name: str, count: int = 10, branch: str = "", auth: str = "") -
 
 
 @mcp.tool()
+@_require_auth
 def get_dependencies(repo_name: str, auth: str = "") -> str:
     """
     Read the build file (build.gradle, pom.xml, or package.json) for a repo.
@@ -567,10 +904,6 @@ def get_dependencies(repo_name: str, auth: str = "") -> str:
         repo_name: Repository name
         auth:      Auth token (required only if MCP_AUTH_TOKEN is set)
     """
-    auth_err = _check_auth(auth)
-    if auth_err:
-        return auth_err
-
     repo = _resolve_repo(repo_name)
 
     for build_file in ["build.gradle", "build.gradle.kts", "pom.xml", "package.json", "pyproject.toml",
@@ -584,20 +917,17 @@ def get_dependencies(repo_name: str, auth: str = "") -> str:
 
 
 @mcp.tool()
+@_require_auth
 def run_build(repo_name: str, task: str = "build", extra_args: str = "", auth: str = "") -> str:
     """
     Run a build task in a repository. Supports Gradle, Maven, and npm.
 
     Args:
         repo_name:  Repository name
-        task:       Build task — 'build', 'test', 'clean', 'bootRun', etc.
+        task:       Build task - 'build', 'test', 'clean', 'bootRun', etc.
         extra_args: Extra CLI arguments (e.g. '-x test', '--info')
         auth:       Auth token (required only if MCP_AUTH_TOKEN is set)
     """
-    auth_err = _check_auth(auth)
-    if auth_err:
-        return auth_err
-
     if task not in _ALLOWED_BUILD_TASKS:
         return (
             f"[ERROR] Task '{task}' is not in the allowed list. "
@@ -627,6 +957,7 @@ def run_build(repo_name: str, task: str = "build", extra_args: str = "", auth: s
 
 
 @mcp.tool()
+@_require_auth
 def find_repos_with(
     pattern: str,
     file_glob: str = "*.java",
@@ -635,7 +966,7 @@ def find_repos_with(
 ) -> str:
     """
     Find which repos contain a given class, method, config key, or pattern.
-    Returns only repo names and match counts — use search_code for full matches.
+    Returns only repo names and match counts - use search_code for full matches.
     Uses ripgrep if available, falls back to grep.
 
     Args:
@@ -644,27 +975,24 @@ def find_repos_with(
         case_sensitive: Default False
         auth:           Auth token (required only if MCP_AUTH_TOKEN is set)
     """
-    auth_err = _check_auth(auth)
-    if auth_err:
-        return auth_err
-
     if not pattern or not pattern.strip():
         return "[ERROR] pattern is required"
 
     repos = _all_repos()
-    cmd = _build_search_cmd(pattern, file_glob, case_sensitive, context_lines=0, files_only=True)
+    counts, timed_out = _ctx.backend.find_files(pattern, repos, file_glob, case_sensitive)
 
-    hits = []
-    for name, path in repos.items():
-        out = _run(cmd, path)
-        files = [line for line in out.strip().splitlines() if line and not line.startswith("[")]
-        if files:
-            hits.append(f"{name}: {len(files)} file(s)")
+    hits = [f"{name}: {count} file(s)" for name, count in sorted(counts.items())]
 
     if not hits:
         return f"No repos found containing '{pattern}' in {file_glob} files."
 
-    return "\n".join(hits)
+    result = "\n".join(hits)
+    if timed_out:
+        result += (
+            "\n[TIP] Some repos timed out. If graphify is installed, run /graphify on "
+            "those repos for pre-indexed search."
+        )
+    return result
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -700,10 +1028,10 @@ def main():
         "Starting repobridge MCP server (transport=%s, roots=%d, max_output=%d, cache_ttl=%ds, auth=%s, search=%s)",
         args.transport,
         len(REPO_ROOTS),
-        MAX_OUTPUT,
+        _ctx.max_output,
         CACHE_TTL,
-        "enabled" if AUTH_TOKEN else "disabled",
-        "ripgrep" if _HAS_RIPGREP else "grep",
+        "enabled" if _ctx.auth_token else "disabled",
+        "ripgrep" if isinstance(_ctx.backend, RipgrepBackend) else "grep",
     )
 
     mcp.settings.host = args.host

@@ -41,7 +41,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["server.py"]
+only-include = ["server.py", "repobridge_config.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

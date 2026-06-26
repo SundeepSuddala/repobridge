@@ -50,13 +50,13 @@ def tmp_root(tmp_repo: Path) -> Path:
 
 @pytest.fixture(autouse=True)
 def clear_module_cache():
-    """Reset the repo cache between tests."""
+    """Reset repo and IDE caches between tests."""
     import server
-    server._repo_cache = None
-    server._repo_cache_time = 0.0
+    server._repo_cache.invalidate()
+    server._ide_cache.invalidate()
     yield
-    server._repo_cache = None
-    server._repo_cache_time = 0.0
+    server._repo_cache.invalidate()
+    server._ide_cache.invalidate()
 
 
 # ---------------------------------------------------------------------------
@@ -127,25 +127,25 @@ class TestValidateFilePath:
 class TestCheckAuth:
     def test_no_auth_configured_always_passes(self):
         import server
-        with patch.object(server, "AUTH_TOKEN", ""):
+        with patch.object(server._ctx, "auth_token", ""):
             assert server._check_auth("anything") is None
             assert server._check_auth("") is None
 
     def test_correct_token_passes(self):
         import server
-        with patch.object(server, "AUTH_TOKEN", "secret"):
+        with patch.object(server._ctx, "auth_token", "secret"):
             assert server._check_auth("secret") is None
 
     def test_wrong_token_fails(self):
         import server
-        with patch.object(server, "AUTH_TOKEN", "secret"):
+        with patch.object(server._ctx, "auth_token", "secret"):
             result = server._check_auth("wrong")
             assert result is not None
             assert "AUTH ERROR" in result
 
     def test_empty_token_fails_when_auth_configured(self):
         import server
-        with patch.object(server, "AUTH_TOKEN", "secret"):
+        with patch.object(server._ctx, "auth_token", "secret"):
             result = server._check_auth("")
             assert result is not None
 
@@ -187,14 +187,13 @@ class TestValidateExtraArgs:
 class TestTruncate:
     def test_short_text_unchanged(self):
         import server
-        original_max = server.MAX_OUTPUT
-        with patch.object(server, "MAX_OUTPUT", 100):
+        with patch.object(server._ctx, "max_output", 100):
             result = server._truncate("short text")
         assert result == "short text"
 
     def test_long_text_truncated(self):
         import server
-        with patch.object(server, "MAX_OUTPUT", 10):
+        with patch.object(server._ctx, "max_output", 10):
             result = server._truncate("a" * 20, "test ")
         assert len(result) > 10
         assert "truncated" in result
@@ -330,7 +329,7 @@ class TestListRepos:
 
     def test_auth_fails_with_wrong_token(self, tmp_root: Path):
         import server
-        with patch.object(server, "AUTH_TOKEN", "secret"):
+        with patch.object(server._ctx, "auth_token", "secret"):
             with patch.object(server, "REPO_ROOTS", [str(tmp_root)]):
                 result = server.list_repos(auth="wrong")
         assert "AUTH ERROR" in result

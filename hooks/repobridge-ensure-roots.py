@@ -14,31 +14,12 @@ Exit 0 always - a bug here must never block MCP tool calls.
 """
 from __future__ import annotations
 
-import json
 import os
 import sys
-from pathlib import Path
 
-
-def _has_roots() -> bool:
-    """Return True if roots are already configured (env var or config file)."""
-    env_roots = os.environ.get("REPOBRIDGE_ROOTS", "")
-    if env_roots:
-        roots = [r.strip() for r in env_roots.split(":") if r.strip()]
-        if roots:
-            return True
-
-    cfg_path = Path.home() / ".repobridge.json"
-    if cfg_path.exists():
-        try:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            raw = cfg.get("repo_roots")
-            if raw and isinstance(raw, list) and any(r for r in raw if r):
-                return True
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    return False
+# shared config module lives one level up (project root)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from repobridge_config import has_roots as _has_roots
 
 
 def _ask_configure() -> None:

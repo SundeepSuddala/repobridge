@@ -24,6 +24,10 @@ import shlex
 import sys
 from pathlib import Path
 
+# shared config module lives one level up (project root)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from repobridge_config import load_roots, discover_repos
+
 # Verbs that indicate a read/search-only intent.
 _READ_VERBS = frozenset({
     "grep", "egrep", "fgrep", "rg", "ag",
@@ -43,37 +47,11 @@ _PATH_RE = re.compile(r"^(/|~/|~[a-zA-Z])")
 
 
 def _load_roots() -> list[Path]:
-    """Mirror server.py _get_repo_roots(): env var > ~/.repobridge.json."""
-    env_roots = os.environ.get("REPOBRIDGE_ROOTS", "")
-    if env_roots:
-        return [Path(os.path.expanduser(r.strip())).resolve()
-                for r in env_roots.split(":") if r.strip()]
-
-    cfg_path = Path.home() / ".repobridge.json"
-    if cfg_path.exists():
-        try:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            raw = cfg.get("repo_roots")
-            if raw and isinstance(raw, list):
-                return [Path(os.path.expanduser(r)).resolve() for r in raw if r]
-        except (json.JSONDecodeError, OSError):
-            pass
-    return []
+    return load_roots()
 
 
 def _discover_repos(roots: list[Path]) -> dict[str, Path]:
-    """Mirror server.py _all_repos(): scan one level deep for .git dirs."""
-    repos: dict[str, Path] = {}
-    for root in roots:
-        if not root.is_dir():
-            continue
-        try:
-            for entry in sorted(root.iterdir()):
-                if entry.is_dir() and (entry / ".git").exists():
-                    repos[entry.name] = entry.resolve()
-        except PermissionError:
-            pass
-    return repos
+    return discover_repos(roots)
 
 
 def _current_repo(cwd: Path, repos: dict[str, Path]) -> str | None:
@@ -136,7 +114,6 @@ def _extract_path_tokens(command: str, cwd: Path) -> list[Path]:
 
         # git -C <path> pattern - capture the path after -C
         if tok == "-C" and i + 1 < len(tokens):
-            skip_next = False
             next_tok = tokens[i + 1]
             try:
                 p = Path(os.path.expanduser(next_tok)).resolve()
