@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -49,14 +50,18 @@ def tmp_root(tmp_repo: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def clear_module_cache():
-    """Reset repo and IDE caches between tests."""
+def clear_module_cache(tmp_path: Path, monkeypatch):
+    """Reset repo/IDE/org caches between tests and isolate the clone cache dir
+    from the real ~/.repobridge/remote-clones on the machine running the tests."""
     import server
     server._repo_cache.invalidate()
     server._ide_cache.invalidate()
+    server._org_cache.invalidate()
+    monkeypatch.setattr(server, "_CLONE_CACHE_DIR", tmp_path / ".repobridge-test-clones")
     yield
     server._repo_cache.invalidate()
     server._ide_cache.invalidate()
+    server._org_cache.invalidate()
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +282,16 @@ class TestAllRepos:
             second = server._all_repos()
         assert first is second
 
+    def test_merges_clone_cache_dir(self, tmp_root: Path):
+        import server
+        cloned_repo = server._CLONE_CACHE_DIR / "cloned-service"
+        cloned_repo.mkdir(parents=True)
+        (cloned_repo / ".git").mkdir()
+        with patch.object(server, "REPO_ROOTS", [str(tmp_root)]):
+            repos = server._all_repos()
+        assert "my-service" in repos
+        assert "cloned-service" in repos
+
 
 class TestResolveRepo:
     def test_resolves_known_repo(self, tmp_root: Path):
@@ -287,9 +302,28 @@ class TestResolveRepo:
 
     def test_raises_for_unknown_repo(self, tmp_root: Path):
         import server
-        with patch.object(server, "REPO_ROOTS", [str(tmp_root)]):
+        with patch.object(server, "REPO_ROOTS", [str(tmp_root)]), \
+             patch.object(server, "_resolve_github_org", return_value="testorg"):
             with pytest.raises(ValueError, match="not found"):
                 server._resolve_repo("nonexistent")
+
+    def test_unknown_repo_message_names_org_and_clone_tool(self, tmp_root: Path):
+        import server
+        with patch.object(server, "REPO_ROOTS", [str(tmp_root)]), \
+             patch.object(server, "_resolve_github_org", return_value="testorg"):
+            with pytest.raises(ValueError, match="testorg") as exc_info:
+                server._resolve_repo("nonexistent")
+        assert "clone_github_repo" in str(exc_info.value)
+
+    def test_touches_usage_marker_for_cloned_repo(self):
+        import server
+        server._CLONE_CACHE_DIR.mkdir(parents=True)
+        cloned_repo = server._CLONE_CACHE_DIR / "cloned-service"
+        cloned_repo.mkdir()
+        (cloned_repo / ".git").mkdir()
+        with patch.object(server, "REPO_ROOTS", []):
+            server._resolve_repo("cloned-service")
+        assert (cloned_repo / ".last_used").exists()
 
     def test_raises_for_empty_name(self, tmp_root: Path):
         import server
@@ -537,3 +571,140 @@ class TestFindReposWith:
         with patch.object(server, "REPO_ROOTS", [str(tmp_root)]):
             result = server.find_repos_with("")
         assert "ERROR" in result
+
+
+# ---------------------------------------------------------------------------
+# MCP tools: clone_github_repo
+# ---------------------------------------------------------------------------
+
+class TestCloneGithubRepo:
+    def test_rejects_invalid_repo_name(self):
+        import server
+        result = server.clone_github_repo("../escape")
+        assert "ERROR" in result
+        assert "repo_name" in result
+
+    def test_rejects_repo_name_with_path_separator(self):
+        import server
+        result = server.clone_github_repo("foo/bar")
+        assert "ERROR" in result
+
+    def test_short_circuits_when_already_cloned(self):
+        import server
+        dest = server._CLONE_CACHE_DIR / "already-here"
+        (dest / ".git").mkdir(parents=True)
+        result = server.clone_github_repo("already-here")
+        assert "already cloned" in result.lower()
+
+    def test_unresolvable_org_returns_error(self):
+        import server
+        with patch.object(server, "_resolve_github_org", return_value="unknown"):
+            result = server.clone_github_repo("some-repo")
+        assert "ERROR" in result
+        assert "github_org" in result
+
+    def test_successful_clone_builds_expected_command_and_updates_cache(self):
+        import server
+
+        def fake_clone(cmd, **kwargs):
+            dest = Path(cmd[4])
+            (dest / ".git").mkdir(parents=True)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(server.subprocess, "run", side_effect=fake_clone) as mock_run, \
+             patch.object(server, "REPO_ROOTS", []):
+            result = server.clone_github_repo("mainframe-gateway", org="testorg")
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:3] == ["gh", "repo", "clone"]
+        assert cmd[3] == "testorg/mainframe-gateway"
+        assert "Cloned testorg/mainframe-gateway" in result
+
+        repos = server._all_repos()
+        assert "mainframe-gateway" in repos
+
+    def test_depth_flag_appended_when_positive(self):
+        import server
+
+        def fake_clone(cmd, **kwargs):
+            dest = Path(cmd[4])
+            (dest / ".git").mkdir(parents=True)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(server.subprocess, "run", side_effect=fake_clone) as mock_run:
+            server.clone_github_repo("mainframe-gateway", org="testorg", depth=1)
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd[-2:] == ["--", "--depth=1"]
+
+    def test_gh_failure_surfaces_stderr(self):
+        import server
+        mock_result = MagicMock(returncode=1, stdout="", stderr="gh: repo not found")
+        with patch.object(server.subprocess, "run", return_value=mock_result):
+            result = server.clone_github_repo("nonexistent-repo", org="testorg")
+        assert "ERROR" in result
+        assert "repo not found" in result
+
+    def test_gh_not_installed_returns_error(self):
+        import server
+        with patch.object(server.subprocess, "run", side_effect=FileNotFoundError):
+            result = server.clone_github_repo("mainframe-gateway", org="testorg")
+        assert "ERROR" in result
+        assert "gh" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Idle clone eviction: _prune_stale_clones
+# ---------------------------------------------------------------------------
+
+class TestPruneStaleClones:
+    def _make_clone(self, server, name: str, *, marker: bool = True) -> Path:
+        clone = server._CLONE_CACHE_DIR / name
+        (clone / ".git").mkdir(parents=True)
+        if marker:
+            (clone / ".last_used").touch()
+        return clone
+
+    def test_prunes_stale_marker(self):
+        import server
+        clone = self._make_clone(server, "stale-repo")
+        old = time.time() - (2 * 86400)
+        os.utime(clone / ".last_used", (old, old))
+
+        with patch.object(server, "CLONE_IDLE_DAYS", 1.0):
+            server._prune_stale_clones()
+
+        assert not clone.exists()
+
+    def test_keeps_fresh_marker(self):
+        import server
+        clone = self._make_clone(server, "fresh-repo")
+
+        with patch.object(server, "CLONE_IDLE_DAYS", 1.0):
+            server._prune_stale_clones()
+
+        assert clone.exists()
+
+    def test_missing_marker_falls_back_to_dir_mtime(self):
+        import server
+        clone = self._make_clone(server, "no-marker-repo", marker=False)
+        old = time.time() - (2 * 86400)
+        os.utime(clone, (old, old))
+
+        with patch.object(server, "CLONE_IDLE_DAYS", 1.0):
+            server._prune_stale_clones()
+
+        assert not clone.exists()
+
+    def test_unsafe_named_entry_is_never_touched(self):
+        import server
+        server._CLONE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        unsafe = server._CLONE_CACHE_DIR / "weird name!"
+        unsafe.mkdir()
+        old = time.time() - (10 * 86400)
+        os.utime(unsafe, (old, old))
+
+        with patch.object(server, "CLONE_IDLE_DAYS", 1.0):
+            server._prune_stale_clones()
+
+        assert unsafe.exists()

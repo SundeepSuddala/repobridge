@@ -26,6 +26,8 @@ Tools exposed:
   get_dependencies    — read build.gradle / pom.xml / package.json for a repo
   run_build           — run ./gradlew build (or mvn/npm) in a repo
   find_repos_with     — find which repos contain a class/method/config key
+  clone_github_repo   — clone a repo from the linked GitHub org into a local
+                         cache so every other tool above can then use it
 """
 
 from __future__ import annotations
@@ -64,6 +66,10 @@ logger = logging.getLogger("repobridge")
 _DEFAULT_REPO_ROOTS: list[str] = []  # Users must configure their own roots
 _DEFAULT_MAX_OUTPUT = 20_000
 _DEFAULT_CACHE_TTL = 300  # seconds
+_DEFAULT_CLONE_IDLE_DAYS = 7.0
+_ORG_CACHE_TTL = 3600.0  # seconds
+_CLONE_CACHE_DIR = (Path.home() / ".repobridge" / "remote-clones").resolve()
+_SAFE_REPO_NAME_RE = re.compile(r"^[\w.-]+$")
 _ALLOWED_BUILD_TASKS = frozenset({
     "build", "test", "clean", "assemble", "check", "bootRun",
     "compileJava", "compileKotlin", "jar", "bootJar",
@@ -165,9 +171,26 @@ def _get_cache_ttl() -> int:
     return _DEFAULT_CACHE_TTL
 
 
+def _get_clone_idle_days() -> float:
+    """Resolve clone idle-eviction threshold from env var > config file > default."""
+    env_val = os.environ.get("REPOBRIDGE_CLONE_IDLE_DAYS")
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            logger.warning("Invalid REPOBRIDGE_CLONE_IDLE_DAYS value: %s, using default", env_val)
+
+    config_val = _config.get("clone_idle_days")
+    if isinstance(config_val, (int, float)) and config_val > 0:
+        return float(config_val)
+
+    return _DEFAULT_CLONE_IDLE_DAYS
+
+
 REPO_ROOTS = _get_repo_roots()
 MAX_OUTPUT = _get_max_output()
 CACHE_TTL = _get_cache_ttl()
+CLONE_IDLE_DAYS = _get_clone_idle_days()
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", _config.get("auth_token", ""))
 
 # Transport settings (configurable via CLI args, env vars, or config file)
@@ -355,6 +378,7 @@ _IDE_CACHE_TTL = 30.0
 
 _repo_cache: TTLCache[dict[str, Path]] = TTLCache(CACHE_TTL)
 _ide_cache: TTLCache[list[tuple[str, str]]] = TTLCache(_IDE_CACHE_TTL)
+_org_cache: TTLCache[str] = TTLCache(_ORG_CACHE_TTL)
 
 
 def _invalidate_cache() -> None:
@@ -382,7 +406,8 @@ def _all_repos() -> dict[str, Path]:
     Results are cached for CACHE_TTL seconds.
     """
     def _discover() -> dict[str, Path]:
-        repos = discover_repos([Path(r) for r in REPO_ROOTS])
+        roots = [Path(r) for r in REPO_ROOTS] + [_CLONE_CACHE_DIR]
+        repos = discover_repos(roots)
         logger.debug("Discovered %d repositories", len(repos))
         return repos
 
@@ -397,8 +422,16 @@ def _resolve_repo(repo_name: str) -> Path:
     repos = _all_repos()
     if repo_name not in repos:
         available = ", ".join(sorted(repos.keys()))
-        raise ValueError(f"Repo '{repo_name}' not found. Available: {available}")
-    return repos[repo_name]
+        org = _resolve_github_org()
+        raise ValueError(
+            f"Repo '{repo_name}' not found locally. Available: {available}. "
+            f"If it exists in the '{org}' GitHub org, call clone_github_repo('{repo_name}') first."
+        )
+
+    path = repos[repo_name]
+    if path.is_relative_to(_CLONE_CACHE_DIR):
+        _touch_clone_usage(path)
+    return path
 
 
 def _validate_file_path(repo: Path, file_path: str) -> Path:
@@ -436,6 +469,72 @@ def _require_auth(f):
             return auth_err
         return f(*args, **kwargs)
     return wrapper
+
+
+# ── GitHub clone fallback ──────────────────────────────────────────────────────
+
+
+def _resolve_github_org() -> str:
+    """Resolve the GitHub org to scope clones to: config > env > linked gh account's own org."""
+    config_val = _config.get("github_org")
+    if isinstance(config_val, str) and config_val.strip():
+        return config_val.strip()
+
+    env_val = os.environ.get("REPOBRIDGE_GITHUB_ORG")
+    if env_val:
+        return env_val
+
+    def _lookup() -> str:
+        try:
+            result = subprocess.run(
+                ["gh", "api", "user/orgs", "--jq", ".[0].login"],
+                capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=15,
+            )
+            org = result.stdout.strip()
+            return org if org else "unknown"
+        except (subprocess.TimeoutExpired, OSError):
+            return "unknown"
+
+    return _org_cache.get(_lookup)
+
+
+def _touch_clone_usage(clone_path: Path) -> None:
+    """Record that a cloned repo was just used, for idle-eviction purposes."""
+    try:
+        (clone_path / ".last_used").touch()
+    except OSError as e:
+        logger.warning("Could not update clone usage marker for %s: %s", clone_path, e)
+
+
+def _prune_stale_clones() -> None:
+    """Remove cloned repos under _CLONE_CACHE_DIR untouched for longer than CLONE_IDLE_DAYS."""
+    if not _CLONE_CACHE_DIR.exists():
+        return
+
+    idle_seconds = CLONE_IDLE_DAYS * 86400
+    now = time.time()
+    pruned_any = False
+
+    for entry in _CLONE_CACHE_DIR.iterdir():
+        if not entry.is_dir() or not _SAFE_REPO_NAME_RE.match(entry.name):
+            continue
+
+        marker = entry / ".last_used"
+        try:
+            mtime = marker.stat().st_mtime if marker.exists() else entry.stat().st_mtime
+        except OSError:
+            continue
+
+        if now - mtime > idle_seconds:
+            try:
+                shutil.rmtree(entry)
+                logger.info("Pruned idle GitHub clone: %s", entry.name)
+                pruned_any = True
+            except OSError as e:
+                logger.warning("Could not prune clone %s: %s", entry.name, e)
+
+    if pruned_any:
+        _invalidate_cache()
 
 
 # ── IDE detection ─────────────────────────────────────────────────────────────
@@ -1002,6 +1101,68 @@ def find_repos_with(
     return result
 
 
+@mcp.tool()
+@_require_auth
+def clone_github_repo(repo_name: str, org: str = "", depth: int = 0, auth: str = "") -> str:
+    """
+    Clone a repo from the linked GitHub org into a local cache so every other
+    tool (search_code, read_file, git_log, get_dependencies, run_build, ...)
+    can then use it like any other local repo. This writes to disk and makes
+    a network call - callers should confirm with the user before invoking it
+    for a repo name they haven't been explicitly told to clone.
+
+    Clones are disposable: unused ones are pruned automatically after
+    CLONE_IDLE_DAYS and can be deleted manually at any time - they just get
+    re-cloned on the next request.
+
+    Args:
+        repo_name: Repository name (no path separators, e.g. 'mainframe-gateway')
+        org:       GitHub org/owner to clone from (default: resolved from config/env/linked account)
+        depth:     Shallow-clone depth for large repos (0 = full clone with history)
+        auth:      Auth token (required only if MCP_AUTH_TOKEN is set)
+    """
+    if not repo_name or not _SAFE_REPO_NAME_RE.match(repo_name):
+        return "[ERROR] repo_name must be non-empty and match ^[\\w.-]+$ (no path separators)"
+
+    _prune_stale_clones()
+
+    dest = _CLONE_CACHE_DIR / repo_name
+    if (dest / ".git").exists():
+        return f"'{repo_name}' is already cloned at {dest} - use the existing tools directly."
+
+    resolved_org = org.strip() if org.strip() else _resolve_github_org()
+    if resolved_org == "unknown":
+        return "[ERROR] Could not resolve a GitHub org. Set 'github_org' in ~/.repobridge.json or pass org= explicitly."
+
+    _CLONE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    cmd = ["gh", "repo", "clone", f"{resolved_org}/{repo_name}", str(dest)]
+    if depth > 0:
+        cmd += ["--", f"--depth={depth}"]
+
+    logger.info("Cloning %s/%s into %s", resolved_org, repo_name, dest)
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return "[ERROR] Clone timed out after 120s"
+    except FileNotFoundError:
+        return "[ERROR] 'gh' CLI not found - install GitHub CLI and run 'gh auth login'"
+    except OSError as e:
+        return f"[ERROR] {e}"
+
+    if result.returncode != 0:
+        return f"[ERROR] {result.stderr.strip() or result.stdout.strip()}"
+
+    _touch_clone_usage(dest)
+    _invalidate_cache()
+    return (
+        f"Cloned {resolved_org}/{repo_name} to {dest}. "
+        f"It's now visible to every other repobridge tool as repo_name='{repo_name}'."
+    )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
@@ -1040,6 +1201,8 @@ def main():
         "enabled" if _ctx.auth_token else "disabled",
         "ripgrep" if isinstance(_ctx.backend, RipgrepBackend) else "grep",
     )
+
+    _prune_stale_clones()
 
     mcp.settings.host = args.host
     mcp.settings.port = args.port

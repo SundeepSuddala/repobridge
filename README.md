@@ -89,7 +89,9 @@ Edit `~/.repobridge.json`:
   ],
   "max_output": 20000,
   "cache_ttl_seconds": 300,
-  "auth_token": ""
+  "auth_token": "",
+  "github_org": "",
+  "clone_idle_days": 7
 }
 ```
 
@@ -126,6 +128,8 @@ export LOG_LEVEL="DEBUG"                 # DEBUG | INFO | WARNING | ERROR
 | Max output | `REPOBRIDGE_MAX_OUTPUT` | `max_output` | — | 20,000 chars |
 | Cache TTL | — | `cache_ttl_seconds` | — | 300s |
 | Auth token | `MCP_AUTH_TOKEN` | `auth_token` | — | `""` (disabled) |
+| GitHub org | `REPOBRIDGE_GITHUB_ORG` | `github_org` | — | linked `gh` account's own org |
+| Clone idle eviction | `REPOBRIDGE_CLONE_IDLE_DAYS` | `clone_idle_days` | — | 7 days |
 | Transport | `MCP_TRANSPORT` | `transport` | `--transport` | `stdio` |
 | Host | `MCP_HOST` | `host` | `--host` | `127.0.0.1` |
 | Port | `MCP_PORT` | `port` | `--port` | `7200` |
@@ -526,6 +530,33 @@ find_repos_with(pattern="react-router", file_glob="package.json")
 | `pattern` | *required* | Text or regex |
 | `file_glob` | `"*.java"` | File type filter |
 | `case_sensitive` | `False` | Case sensitivity |
+
+---
+
+### `clone_github_repo`
+
+Every tool above only sees repos already cloned under `repo_roots`. When a
+repo isn't there (e.g. it only exists on GitHub), the "not found" error names
+your linked org and points at this tool - clone it once, then every other
+tool works on it exactly like a local repo, no extra setup.
+
+Clones live in `~/.repobridge/remote-clones/` (safe to delete anytime - repos
+just get re-cloned on demand) and are pruned automatically after
+`clone_idle_days` of no use.
+
+This makes a network call and writes to disk - confirm with the user before
+cloning a repo you weren't explicitly told to.
+
+```
+clone_github_repo(repo_name="mainframe-gateway")
+clone_github_repo(repo_name="mainframe-gateway", org="winsupplyinc", depth=1)
+```
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `repo_name` | *required* | Repository name, no path separators |
+| `org` | `""` | GitHub org/owner (default: resolved from config/env/linked `gh` account) |
+| `depth` | `0` | Shallow-clone depth for large repos (`0` = full history) |
 
 ---
 
