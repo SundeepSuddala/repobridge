@@ -708,3 +708,90 @@ class TestPruneStaleClones:
             server._prune_stale_clones()
 
         assert unsafe.exists()
+
+
+# ---------------------------------------------------------------------------
+# MCP tools: search_github
+# ---------------------------------------------------------------------------
+
+class TestSearchGithub:
+    def test_empty_query_returns_error(self):
+        import server
+        result = server.search_github("")
+        assert "ERROR" in result
+
+    def test_unresolvable_org_returns_error(self):
+        import server
+        with patch.object(server, "_resolve_github_org", return_value="unknown"):
+            result = server.search_github("tableName")
+        assert "ERROR" in result
+        assert "github_org" in result
+
+    def test_owner_flag_always_present(self):
+        import server
+        mock_result = MagicMock(returncode=0, stdout="[]", stderr="")
+        with patch.object(server.subprocess, "run", return_value=mock_result) as mock_run, \
+             patch.object(server, "_resolve_github_org", return_value="testorg"):
+            server.search_github("tableName")
+        cmd = mock_run.call_args.args[0]
+        assert "--owner" in cmd
+        assert cmd[cmd.index("--owner") + 1] == "testorg"
+
+    def test_repo_and_extension_flags_built(self):
+        import server
+        mock_result = MagicMock(returncode=0, stdout="[]", stderr="")
+        with patch.object(server.subprocess, "run", return_value=mock_result) as mock_run, \
+             patch.object(server, "_resolve_github_org", return_value="testorg"):
+            server.search_github("tableName", extension="java", repo="mainframe-gateway")
+        cmd = mock_run.call_args.args[0]
+        assert cmd[cmd.index("--repo") + 1] == "testorg/mainframe-gateway"
+        assert cmd[cmd.index("--extension") + 1] == "java"
+
+    def test_no_matches_returns_message(self):
+        import server
+        mock_result = MagicMock(returncode=0, stdout="[]", stderr="")
+        with patch.object(server.subprocess, "run", return_value=mock_result), \
+             patch.object(server, "_resolve_github_org", return_value="testorg"):
+            result = server.search_github("zzz_no_such_pattern")
+        assert "No matches" in result
+
+    def test_gh_failure_surfaces_stderr(self):
+        import server
+        mock_result = MagicMock(returncode=1, stdout="", stderr="gh: rate limited")
+        with patch.object(server.subprocess, "run", return_value=mock_result), \
+             patch.object(server, "_resolve_github_org", return_value="testorg"):
+            result = server.search_github("tableName")
+        assert "ERROR" in result
+        assert "rate limited" in result
+
+    def test_groups_results_by_repo_with_snippet(self):
+        import server
+        hits = [
+            {
+                "path": "src/main/java/Foo.java",
+                "repository": {"nameWithOwner": "testorg/repo-one"},
+                "textMatches": [{"fragment": "private String tableName;"}],
+            },
+            {
+                "path": "src/main/java/Bar.java",
+                "repository": {"nameWithOwner": "testorg/repo-two"},
+                "textMatches": [{"fragment": "String getTableName() { return tableName; }"}],
+            },
+        ]
+        mock_result = MagicMock(returncode=0, stdout=json.dumps(hits), stderr="")
+        with patch.object(server.subprocess, "run", return_value=mock_result), \
+             patch.object(server, "_resolve_github_org", return_value="testorg"):
+            result = server.search_github("tableName")
+
+        assert "testorg/repo-one" in result
+        assert "testorg/repo-two" in result
+        assert "Foo.java" in result
+        assert "tableName" in result
+
+    def test_gh_not_installed_returns_error(self):
+        import server
+        with patch.object(server.subprocess, "run", side_effect=FileNotFoundError), \
+             patch.object(server, "_resolve_github_org", return_value="testorg"):
+            result = server.search_github("tableName")
+        assert "ERROR" in result
+        assert "gh" in result.lower()

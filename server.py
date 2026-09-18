@@ -28,6 +28,8 @@ Tools exposed:
   find_repos_with     — find which repos contain a class/method/config key
   clone_github_repo   — clone a repo from the linked GitHub org into a local
                          cache so every other tool above can then use it
+  search_github       — search code across every repo in the linked GitHub
+                         org, no local clone needed
 """
 
 from __future__ import annotations
@@ -496,6 +498,23 @@ def _resolve_github_org() -> str:
             return "unknown"
 
     return _org_cache.get(_lookup)
+
+
+def _run_gh_search_json(cmd: list[str], timeout: int = 30) -> tuple[str, int]:
+    """Run a `gh` JSON-output command. Returns (stdout_or_error, returncode)."""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return result.stderr.strip() or result.stdout.strip(), result.returncode
+        return result.stdout, 0
+    except subprocess.TimeoutExpired:
+        return f"Command timed out after {timeout}s", 1
+    except FileNotFoundError:
+        return "'gh' CLI not found - install GitHub CLI and run 'gh auth login'", 1
+    except OSError as e:
+        return str(e), 1
 
 
 def _touch_clone_usage(clone_path: Path) -> None:
@@ -1161,6 +1180,71 @@ def clone_github_repo(repo_name: str, org: str = "", depth: int = 0, auth: str =
         f"Cloned {resolved_org}/{repo_name} to {dest}. "
         f"It's now visible to every other repobridge tool as repo_name='{repo_name}'."
     )
+
+
+@mcp.tool()
+@_require_auth
+def search_github(
+    query: str,
+    extension: str = "",
+    repo: str = "",
+    max_results: int = 30,
+    auth: str = "",
+) -> str:
+    """
+    Search code across every repo in the linked GitHub org - no local clone
+    needed. Use this to discover which repos use something (e.g. 'tableName')
+    before deciding whether to dig into any of them with clone_github_repo.
+
+    This is GitHub's legacy code-search engine (via `gh search code`): literal
+    keyword matching only, no regex, no semantic understanding. For a broad
+    "how do we implement Okta / a GCS call" question, try a few concrete
+    keyword variants (a class name, an import path, an annotation) rather
+    than one natural-language query.
+
+    Args:
+        query:       Literal keyword(s) to search for (e.g. 'tableName', 'OktaAuth')
+        extension:   Restrict to a file extension (e.g. 'java', 'ts')
+        repo:        Restrict to one repo in the org (e.g. 'mainframe-gateway')
+        max_results: Cap on total matches returned across the org
+        auth:        Auth token (required only if MCP_AUTH_TOKEN is set)
+    """
+    if not query or not query.strip():
+        return "[ERROR] query is required"
+
+    org = _resolve_github_org()
+    if org == "unknown":
+        return "[ERROR] Could not resolve a GitHub org. Set 'github_org' in ~/.repobridge.json or pass a repo= that includes the org."
+
+    cmd = ["gh", "search", "code", query, "--owner", org, "--json", "path,repository,textMatches", "-L", str(max_results)]
+    if repo:
+        cmd += ["--repo", f"{org}/{repo}"]
+    if extension:
+        cmd += ["--extension", extension]
+
+    logger.info("Searching GitHub org %s for %r", org, query)
+    output, returncode = _run_gh_search_json(cmd)
+    if returncode != 0:
+        return f"[ERROR] {output}"
+
+    try:
+        hits = json.loads(output) if output.strip() else []
+    except json.JSONDecodeError:
+        return f"[ERROR] Could not parse gh search output: {output[:200]}"
+
+    if not hits:
+        return f"No matches for '{query}' in the '{org}' org."
+
+    by_repo: dict[str, list[str]] = {}
+    for hit in hits:
+        repo_name = hit.get("repository", {}).get("nameWithOwner", "unknown")
+        path = hit.get("path", "unknown")
+        fragments = [m.get("fragment", "") for m in hit.get("textMatches", []) if m.get("fragment")]
+        snippet = fragments[0][:300] if fragments else ""
+        by_repo.setdefault(repo_name, []).append(f"  {path}\n    {snippet}" if snippet else f"  {path}")
+
+    blocks = [f"=== {name} ===\n" + "\n".join(entries) for name, entries in sorted(by_repo.items())]
+    return _truncate("\n\n".join(blocks), "search results ")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

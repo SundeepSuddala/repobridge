@@ -560,6 +560,33 @@ clone_github_repo(repo_name="mainframe-gateway", org="winsupplyinc", depth=1)
 
 ---
 
+### `search_github`
+
+Search code across every repo in the linked GitHub org - no local clone
+needed. Use it to discover which repos use something before deciding
+whether to `clone_github_repo` any of them for a deeper look.
+
+This is GitHub's legacy code-search engine (via `gh search code`): literal
+keyword matching only, no regex, no semantic understanding. For a broad "how
+do we implement Okta / a GCS call" question, try a few concrete keyword
+variants (a class name, an import path, an annotation) rather than one
+natural-language query.
+
+```
+search_github(query="tableName")
+search_github(query="OktaAuth", extension="java")
+search_github(query="storage.googleapis.com", repo="mainframe-gateway")
+```
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `query` | *required* | Literal keyword(s) to search for |
+| `extension` | `""` | Restrict to a file extension (e.g. `java`, `ts`) |
+| `repo` | `""` | Restrict to one repo in the org |
+| `max_results` | `30` | Cap on total matches returned across the org |
+
+---
+
 ### `get_ide_status`
 
 Detect which IDEs are running and which semantic MCP tools they expose. Call this before `search_code` when looking up symbols - IDE tools give semantic results (handles generics, overloads, cross-module resolution) while `search_code` gives text matches.
