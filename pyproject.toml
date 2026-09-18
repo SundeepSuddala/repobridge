@@ -1,6 +1,6 @@
 [project]
 name = "repobridge"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP server for navigating and working across multiple Git repositories"
 requires-python = ">=3.11"
 readme = "README.md"

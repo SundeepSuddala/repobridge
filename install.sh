@@ -5,8 +5,12 @@
 #   1. Creates .venv + installs repobridge (if not already set up)
 #   2. Prompts for repo root directories -> writes ~/.repobridge.json
 #      (if already configured, skips; if skipped, lazy-create hook handles it)
-#   3. Registers the MCP server globally (user scope in Claude Code)
-#   4. Installs two PreToolUse hooks into ~/.claude/settings.json:
+#   3. Starts the MCP server as a persistent background service (launchd on
+#      macOS) listening on http://localhost:<port>/mcp - required by MCP
+#      client policies that only allow servers reachable via localhost, and
+#      needed for the server to survive terminal/session restarts.
+#   4. Registers the MCP server globally (user scope in Claude Code)
+#   5. Installs two PreToolUse hooks into ~/.claude/settings.json:
 #        - hooks/repobridge-nudge.py       (Bash -> ask when targeting other repos)
 #        - hooks/repobridge-ensure-roots.py (mcp__repobridge__* -> prompt if no roots)
 #
@@ -21,6 +25,11 @@ SETTINGS="$HOME/.claude/settings.json"
 NUDGE_HOOK="$SCRIPT_DIR/hooks/repobridge-nudge.py"
 ROOTS_HOOK="$SCRIPT_DIR/hooks/repobridge-ensure-roots.py"
 REPOBRIDGE_CFG="$HOME/.repobridge.json"
+REPOBRIDGE_PORT="${REPOBRIDGE_PORT:-7200}"
+REPOBRIDGE_URL="http://localhost:${REPOBRIDGE_PORT}/mcp"
+PLIST_LABEL="com.repobridge.server"
+PLIST_DEST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+PLIST_TEMPLATE="$SCRIPT_DIR/launchd/${PLIST_LABEL}.plist.template"
 
 # ── Colours (no-op when not a TTY) ──────────────────────────────────────────
 _tty() { [ -t 1 ]; }
@@ -117,25 +126,64 @@ PYEOF
     fi
 fi
 
-# ── Step 3: Register MCP server globally ─────────────────────────────────────
-blue "[3/4] Registering MCP server (global / user scope)..."
+# ── Step 3: Start persistent background service (launchd on macOS) ──────────
+blue "[3/5] Starting repobridge as a background service..."
+
+if [ "$(uname -s)" = "Darwin" ]; then
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+
+    # Free the port if a manually-started (nohup/foreground) instance is
+    # already bound - launchd's managed process can't bind otherwise and
+    # KeepAlive will crashloop.
+    EXISTING_PIDS="$(lsof -ti ":$REPOBRIDGE_PORT" 2>/dev/null || true)"
+    if [ -n "$EXISTING_PIDS" ]; then
+        warn "Port $REPOBRIDGE_PORT already in use by PID(s) $EXISTING_PIDS - stopping before handing off to launchd."
+        echo "$EXISTING_PIDS" | xargs kill 2>/dev/null || true
+        sleep 1
+    fi
+
+    EXTRA_PATH="$(dirname "$PYTHON")"
+    sed -e "s|__PYTHON__|$PYTHON|g" \
+        -e "s|__SERVER_PY__|$SCRIPT_DIR/server.py|g" \
+        -e "s|__WORKDIR__|$SCRIPT_DIR|g" \
+        -e "s|__PORT__|$REPOBRIDGE_PORT|g" \
+        -e "s|__EXTRA_PATH__|$EXTRA_PATH|g" \
+        -e "s|__LOG_DIR__|$HOME/Library/Logs|g" \
+        "$PLIST_TEMPLATE" > "$PLIST_DEST"
+
+    launchctl bootout "gui/$(id -u)" "$PLIST_DEST" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST"
+    sleep 1
+
+    if launchctl print "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null | grep -q "state = running"; then
+        green "  Service running: $PLIST_LABEL -> $REPOBRIDGE_URL"
+        echo "  Logs: $HOME/Library/Logs/repobridge.log"
+    else
+        warn "Service did not report running - check $HOME/Library/Logs/repobridge.err.log"
+    fi
+else
+    warn "launchd is macOS-only. On Linux, set up a systemd unit or run manually:"
+    echo "    $PYTHON $SCRIPT_DIR/server.py --transport streamable-http --host localhost --port $REPOBRIDGE_PORT"
+fi
+
+# ── Step 4: Register MCP server globally ─────────────────────────────────────
+blue "[4/5] Registering MCP server (global / user scope)..."
 
 if command -v claude &>/dev/null; then
     # Check if already registered
     if claude mcp list 2>/dev/null | grep -q "repobridge"; then
         green "  repobridge already registered in Claude Code - skipping."
     else
-        claude mcp add repobridge -s user -- "$PYTHON" "$SCRIPT_DIR/server.py"
-        green "  Registered via 'claude mcp add'."
+        claude mcp add --transport http repobridge "$REPOBRIDGE_URL" -s user
+        green "  Registered via 'claude mcp add' (http, $REPOBRIDGE_URL)."
     fi
 else
     # Fallback: merge directly into ~/.claude.json
     warn "'claude' CLI not found - falling back to direct ~/.claude.json edit."
-    "$PYTHON" - "$PYTHON" "$SCRIPT_DIR/server.py" <<'PYEOF'
+    "$PYTHON" - "$REPOBRIDGE_URL" <<'PYEOF'
 import json, os, sys
-python_bin = sys.argv[1]
-server_py  = sys.argv[2]
-cfg_path   = os.path.expanduser("~/.claude.json")
+url = sys.argv[1]
+cfg_path = os.path.expanduser("~/.claude.json")
 
 try:
     cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
@@ -146,7 +194,7 @@ servers = cfg.setdefault("mcpServers", {})
 if "repobridge" in servers:
     print("  repobridge already in ~/.claude.json - skipping.")
 else:
-    servers["repobridge"] = {"command": python_bin, "args": [server_py]}
+    servers["repobridge"] = {"type": "http", "url": url}
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
         f.write("\n")
@@ -154,8 +202,8 @@ else:
 PYEOF
 fi
 
-# ── Step 4: Install PreToolUse hooks ─────────────────────────────────────────
-blue "[4/4] Installing Claude Code hooks into $SETTINGS..."
+# ── Step 5: Install PreToolUse hooks ─────────────────────────────────────────
+blue "[5/5] Installing Claude Code hooks into $SETTINGS..."
 
 mkdir -p "$(dirname "$SETTINGS")"
 
@@ -237,7 +285,7 @@ bold "=== Installation complete ==="
 echo ""
 echo "  Hooks installed:  $SETTINGS"
 echo "  Config:           $REPOBRIDGE_CFG"
-echo "  MCP server:       $PYTHON $SCRIPT_DIR/server.py"
+echo "  MCP server:       $REPOBRIDGE_URL (launchd: $PLIST_LABEL)"
 echo ""
 green "Restart Claude Code to load the new hook and MCP server."
 echo ""

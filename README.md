@@ -308,27 +308,30 @@ Go to Cline settings > MCP Servers > Add New, or edit `~/Library/Application Sup
 
 ---
 
-### HTTP/SSE Mode (Remote or Web Clients)
+### HTTP/SSE Mode (Local or Web Clients)
 
 For clients that connect via HTTP instead of stdio, run the server in SSE or streamable-http mode:
 
 ```bash
 # SSE mode (widely supported)
-python server.py --transport sse --host 0.0.0.0 --port 7200
+python server.py --transport sse --host localhost --port 7200
 
-# Streamable HTTP mode (newer)
-python server.py --transport streamable-http --host 0.0.0.0 --port 7200
+# Streamable HTTP mode (newer, recommended - required by enterprise
+# MCP policies that only allow servers reachable via localhost)
+python server.py --transport streamable-http --host localhost --port 7200
 ```
 
-Then point your MCP client to `http://your-host:7200/sse` (SSE) or `http://your-host:7200/mcp` (streamable-http).
+Then point your MCP client to `http://localhost:7200/sse` (SSE) or `http://localhost:7200/mcp` (streamable-http).
+
+Only bind to `0.0.0.0` (or another non-loopback address) if you specifically need remote access and understand the security implications - the server has no built-in TLS or network-level auth.
 
 You can also set these in `~/.repobridge.json`:
 
 ```json
 {
   "repo_roots": ["~/projects"],
-  "transport": "sse",
-  "host": "0.0.0.0",
+  "transport": "streamable-http",
+  "host": "localhost",
   "port": 7200
 }
 ```

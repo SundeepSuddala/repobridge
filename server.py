@@ -615,7 +615,14 @@ def _build_search_cmd(
 
 # ── MCP Server ────────────────────────────────────────────────────────────────
 
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("repobridge")
+except Exception:
+    __version__ = "0.0.0-dev"
+
 mcp = FastMCP("repobridge")
+mcp._mcp_server.version = __version__
 
 
 @mcp.tool()
