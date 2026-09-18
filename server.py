@@ -1202,6 +1202,11 @@ def search_github(
     keyword variants (a class name, an import path, an annotation) rather
     than one natural-language query.
 
+    Output always starts with a "N match(es) across M repo(s): ..." header
+    line naming every matching repo, before the per-file snippets - read that
+    line for the full repo list/count rather than counting the detail blocks,
+    since those may be cut off by output truncation.
+
     Args:
         query:       Literal keyword(s) to search for (e.g. 'tableName', 'OktaAuth')
         extension:   Restrict to a file extension (e.g. 'java', 'ts')
@@ -1243,8 +1248,19 @@ def search_github(
         snippet = fragments[0][:300] if fragments else ""
         by_repo.setdefault(repo_name, []).append(f"  {path}\n    {snippet}" if snippet else f"  {path}")
 
+    repo_names = sorted(by_repo.keys())
+    header = f"{len(hits)} match(es) across {len(repo_names)} repo(s): {', '.join(repo_names)}\n\n"
+    if len(hits) >= max_results:
+        header += (
+            f"[NOTE] Hit the max_results cap ({max_results}) - there may be more matches or "
+            "repos not shown above. Re-run with a higher max_results to confirm completeness.\n\n"
+        )
+
+    # Header goes first (and is never itself truncated below) so the full repo
+    # list/count is always visible even if the detailed snippets get cut off -
+    # by _truncate() here, or by a caller previewing/truncating this string.
     blocks = [f"=== {name} ===\n" + "\n".join(entries) for name, entries in sorted(by_repo.items())]
-    return _truncate("\n\n".join(blocks), "search results ")
+    return header + _truncate("\n\n".join(blocks), "search results ")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

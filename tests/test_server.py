@@ -788,6 +788,42 @@ class TestSearchGithub:
         assert "Foo.java" in result
         assert "tableName" in result
 
+    def test_header_names_all_repos_even_if_body_is_truncated(self):
+        import server
+        hits = [
+            {
+                "path": f"src/File{i}.java",
+                "repository": {"nameWithOwner": f"testorg/repo-{i}"},
+                "textMatches": [{"fragment": "x" * 500}],
+            }
+            for i in range(20)
+        ]
+        mock_result = MagicMock(returncode=0, stdout=json.dumps(hits), stderr="")
+        with patch.object(server.subprocess, "run", return_value=mock_result), \
+             patch.object(server, "_resolve_github_org", return_value="testorg"), \
+             patch.object(server._ctx, "max_output", 200):
+            result = server.search_github("tableName", max_results=100)
+
+        header = result.split("\n\n")[0]
+        for i in range(20):
+            assert f"testorg/repo-{i}" in header
+
+    def test_notes_when_max_results_cap_is_hit(self):
+        import server
+        hits = [
+            {
+                "path": "src/File.java",
+                "repository": {"nameWithOwner": "testorg/repo-one"},
+                "textMatches": [{"fragment": "tableName"}],
+            }
+        ]
+        mock_result = MagicMock(returncode=0, stdout=json.dumps(hits), stderr="")
+        with patch.object(server.subprocess, "run", return_value=mock_result), \
+             patch.object(server, "_resolve_github_org", return_value="testorg"):
+            result = server.search_github("tableName", max_results=1)
+
+        assert "max_results cap" in result
+
     def test_gh_not_installed_returns_error(self):
         import server
         with patch.object(server.subprocess, "run", side_effect=FileNotFoundError), \
